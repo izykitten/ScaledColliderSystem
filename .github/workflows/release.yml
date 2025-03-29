@@ -2,17 +2,20 @@ name: Build Release
 
 on: 
   workflow_dispatch:
+  push:
+    tags:
+      - '*'  # Run when any tag is pushed
+    branches:
+      - main  # Run when pushing to main branch
 
 jobs:
-
   # Validate Repository Configuration
   config:
     runs-on: ubuntu-latest
     outputs:
       config_package: ${{ steps.config_package.outputs.configPackage }}
     steps:
-
-    # Ensure that required repository variable has been created for the Package
+    # Validate repository variable for the Package
     - name: Validate Package Config
       id: config_package
       run: |
@@ -23,7 +26,6 @@ jobs:
         fi
 
   # Build and release the Package
-  # If the repository is not configured properly, this job will be skipped
   build:
     needs: config
     runs-on: ubuntu-latest
@@ -33,55 +35,220 @@ jobs:
       packagePath: Packages/${{ vars.PACKAGE_NAME }}
     if: needs.config.outputs.config_package == 'true'
     steps:
+      # Debug ref info
+      - name: Debug ref info
+        run: |
+          echo "Current ref: ${{ github.ref }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Event name: ${{ github.event_name }}"
 
-      # Checkout Local Repository
+      # Checkout repository
       - name: Checkout
         uses: actions/checkout@3df4ab11eba7bda6032a0b82a6bb43b11571feac
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Get the Package version based on the package.json file
-      - name: Get Version
-        id: version
-        uses: zoexx/github-action-json-file-properties@b9f36ce6ee6fe2680cd3c32b2c62e22eade7e590
-        with: 
-            file_path: "${{ env.packagePath }}/package.json"
-            prop_path: "version"
-    
-      # Configure the Environment Variables needed for releasing the Package
-      - name: Set Environment Variables
+      # Handle dev version on main branch push
+      - name: Create development build
+        if: github.ref == 'refs/heads/main'
         run: |
-          echo "zipFile=${{ vars.PACKAGE_NAME }}-${{ steps.version.outputs.value }}".zip >> $GITHUB_ENV
-          echo "unityPackage=${{ vars.PACKAGE_NAME }}-${{ steps.version.outputs.value }}.unitypackage" >> $GITHUB_ENV
-          echo "version=${{ steps.version.outputs.value }}" >> $GITHUB_ENV
+          # Configure git identity for the runner
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          # Find the latest tag and use it as the base for the dev version
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+          echo "Latest tag found: $LATEST_TAG"
+          
+          # Remove any 'v' prefix from the tag
+          LATEST_VERSION=${LATEST_TAG#v}
+          
+          # Clean the version: remove any existing dev suffix if present
+          CLEAN_VERSION=$(echo $LATEST_VERSION | sed -E 's/(-dev.*)?$//')
+          echo "Clean version for dev build: $CLEAN_VERSION"
+          
+          # Increment the version by 0.0.1 (patch version) for development builds
+          # Split the version into parts
+          IFS='.' read -r -a VERSION_PARTS <<< "$CLEAN_VERSION"
+          MAJOR="${VERSION_PARTS[0]:-0}"
+          MINOR="${VERSION_PARTS[1]:-0}"
+          PATCH="${VERSION_PARTS[2]:-0}"
+          
+          # Increment patch version
+          PATCH=$((PATCH + 1))
+          
+          # Create the incremented version
+          NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "Next version for dev build: $NEXT_VERSION"
+          
+          # Create timestamp for dev version
+          TIMESTAMP=$(date +%Y%m%d%H%M)
+          
+          # Update package.json version
+          if [ -f "${{ env.packagePath }}/package.json" ]; then
+            # Create a valid dev version using semantic versioning with incremented base
+            DEV_VERSION="${NEXT_VERSION}-dev.${TIMESTAMP}"
+            
+            jq --arg ver "$DEV_VERSION" '.version = $ver' "${{ env.packagePath }}/package.json" > tmp.json
+            mv tmp.json "${{ env.packagePath }}/package.json"
+            echo "Updated package.json version to $DEV_VERSION"
+          else
+            echo "WARNING: Could not find package.json at ${{ env.packagePath }}/package.json"
+            ls -la Packages/
+            if [ -d "${{ env.packagePath }}" ]; then
+              ls -la "${{ env.packagePath }}/"
+            fi
+          fi
+          
+          # Set env variables for workflow - use the full semantic version instead of "dev"
+          echo "version=$DEV_VERSION" >> $GITHUB_ENV
+          echo "version_semantic=$DEV_VERSION" >> $GITHUB_ENV
+          echo "zipFile=${{ vars.PACKAGE_NAME }}-$DEV_VERSION.zip" >> $GITHUB_ENV
+          echo "unityPackage=${{ vars.PACKAGE_NAME }}-$DEV_VERSION.unitypackage" >> $GITHUB_ENV
+          echo "ccPackage=com.vrchat.creators.${{ vars.PACKAGE_NAME }}.zip" >> $GITHUB_ENV
+          echo "tag_name=${NEXT_VERSION}-dev.${TIMESTAMP}" >> $GITHUB_ENV
+          
+          # Create a tag with the semantic version in front of dev timestamp
+          git tag -a "${NEXT_VERSION}-dev.${TIMESTAMP}" -m "Development build ${NEXT_VERSION} at $(date)"
+          git push origin "${NEXT_VERSION}-dev.${TIMESTAMP}"
 
-      # Zip the Package for release
+      # Set version based on tag or package.json
+      - name: Determine Version
+        if: github.ref != 'refs/heads/main'
+        id: determine_version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+            echo "Using version from tag: $VERSION"
+          else
+            VERSION=$(jq -r .version "${{ env.packagePath }}/package.json")
+            echo "Using version from package.json: $VERSION"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_ENV
+          echo "zipFile=${{ vars.PACKAGE_NAME }}-$VERSION.zip" >> $GITHUB_ENV
+          echo "unityPackage=${{ vars.PACKAGE_NAME }}-$VERSION.unitypackage" >> $GITHUB_ENV
+          echo "ccPackage=com.vrchat.creators.${{ vars.PACKAGE_NAME }}.zip" >> $GITHUB_ENV
+
+      # Update package.json with tag version
+      - name: Update package.json version
+        if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, 'dev-')
+        run: |
+          VERSION="${{ env.version }}"
+          jq --arg ver "$VERSION" '.version = $ver' "${{ env.packagePath }}/package.json" > temp.json
+          mv temp.json "${{ env.packagePath }}/package.json"
+          echo "Updated package.json version to $VERSION"
+
+      # Create release artifacts
       - name: Create Package Zip
         working-directory: "${{ env.packagePath }}"
         run: zip -r "${{ github.workspace }}/${{ env.zipFile }}" .
       
-      # Build a list of .meta files for future use
       - name: Track Package Meta Files
         run: find "${{ env.packagePath }}/" -name \*.meta >> metaList
       
-      # Make a UnityPackage version of the Package for release
       - name: Create UnityPackage
         uses: pCYSl5EDgo/create-unitypackage@cfcd3cf0391a5ef1306342794866a9897c32af0b
         with:
           package-path: ${{ env.unityPackage }}
           include-files: metaList
       
-      # Make a release tag of the version from the package.json file 
-      - name: Create Tag
-        id: tag_version
-        uses: rickstaa/action-create-tag@88dbf7ff6fe2405f8e8f6c6fdfd78829bc631f83
-        with:
-          tag: "${{ env.version }}"
+      # Create Creator Companion package
+      - name: Create Creator Companion package
+        run: |
+          mkdir -p cc_temp
+          cp -r "${{ env.packagePath }}" cc_temp/package
+          
+          if [ -f "cc_temp/package/package.json" ]; then
+            if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+              # Use the semantic versioned dev build
+              jq --arg ver "${{ env.version_semantic }}" '.version = $ver' "cc_temp/package/package.json" > cc_temp/temp.json
+              mv cc_temp/temp.json "cc_temp/package/package.json"
+              echo "Set Creator Companion package version to ${{ env.version_semantic }}"
+            fi
+          else
+            echo "::error::package.json not found in copied directory"
+            exit 1
+          fi
+          
+          mkdir -p cc_temp/package/.vpmignore
+          
+          cd cc_temp
+          zip -r "${{ github.workspace }}/${{ env.ccPackage }}" .
+          cd "${{ github.workspace }}"
+
+      # Verify artifacts
+      - name: Verify artifacts
+        run: |
+          if [ ! -f "${{ env.zipFile }}" ]; then
+            echo "::error::ZIP file was not created successfully"
+            exit 1
+          fi
+          if [ ! -f "${{ env.unityPackage }}" ]; then
+            echo "::error::UnityPackage file was not created successfully"
+            exit 1
+          fi
+          if [ ! -f "${{ env.ccPackage }}" ]; then
+            echo "::error::Creator Companion package was not created successfully"
+            exit 1
+          fi
+          echo "Artifacts verified successfully"
       
-      # Publish the Release to GitHub
+      - name: Check for additional documentation
+        id: check_docs
+        run: |
+          FILES_TO_INCLUDE=""
+          if [ -f "${{ env.packagePath }}/README.md" ]; then
+            FILES_TO_INCLUDE="${FILES_TO_INCLUDE}${{ env.packagePath }}/README.md\n"
+          fi
+          if [ -f "${{ env.packagePath }}/CHANGELOG.md" ]; then
+            FILES_TO_INCLUDE="${FILES_TO_INCLUDE}${{ env.packagePath }}/CHANGELOG.md\n"
+          fi
+          echo "additional_files<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$FILES_TO_INCLUDE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      # Generate release notes
+      - name: Generate Release Notes
+        id: release_notes
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
+        run: |
+          if [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+            echo "## Development Build" >> $GITHUB_OUTPUT
+            echo "Latest development build from main branch." >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          PREV_TAG=$(git describe --tags --abbrev=0 ${{ github.ref_name }}^ 2>/dev/null || echo "")
+          
+          if [ -n "$PREV_TAG" ]; then
+            echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+            echo "## Changes since $PREV_TAG" >> $GITHUB_OUTPUT
+            git log --pretty=format:"* %s" $PREV_TAG..${{ github.ref_name }} >> $GITHUB_OUTPUT
+            echo -e "\n" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
+            echo "## Initial Release" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      # Publish GitHub release
       - name: Make Release
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844
         with:
           files: |
             ${{ env.zipFile }}
             ${{ env.unityPackage }}
+            ${{ env.ccPackage }}
             ${{ env.packagePath }}/package.json
-          tag_name: ${{ env.version }}
+            ${{ steps.check_docs.outputs.additional_files }}
+          tag_name: ${{ github.ref == 'refs/heads/main' && env.tag_name || env.version }}
+          name: ${{ github.ref == 'refs/heads/main' && format('Development Build {0}', env.tag_name) || format('Release {0}', env.version) }}
+          prerelease: ${{ github.ref == 'refs/heads/main' }}
+          draft: false
+          body: ${{ steps.release_notes.outputs.RELEASE_NOTES || '' }}
